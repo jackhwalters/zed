@@ -7,7 +7,9 @@ use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_client_protocol::{
+    Agent, Builder, Client, ConnectionTo, HandleDispatchFrom, JsonRpcResponse, Lines, Responder,
+};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -667,6 +669,22 @@ fn connect_client_future(
     dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
     connection_tx: futures::channel::oneshot::Sender<ConnectionTo<Agent>>,
 ) -> impl Future<Output = Result<(), acp::Error>> {
+    client_builder(name, dispatch_tx).connect_with(
+        transport,
+        move |connection: ConnectionTo<Agent>| async move {
+            if connection_tx.send(connection).is_err() {
+                log::error!("failed to send ACP connection handle — receiver was dropped");
+            }
+            // Keep the connection alive until the transport closes.
+            futures::future::pending::<Result<(), acp::Error>>().await
+        },
+    )
+}
+
+fn client_builder(
+    name: &'static str,
+    dispatch_tx: mpsc::UnboundedSender<ForegroundWork>,
+) -> Builder<Client, impl HandleDispatchFrom<Agent>> {
     // Each handler forwards its inputs onto the foreground dispatch queue.
     // The SDK requires the closure to be `Send`, so we move a clone of
     // `dispatch_tx` into each one.
@@ -737,16 +755,6 @@ fn connect_client_future(
         .on_receive_notification(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
-        )
-        .connect_with(
-            transport,
-            move |connection: ConnectionTo<Agent>| async move {
-                if connection_tx.send(connection).is_err() {
-                    log::error!("failed to send ACP connection handle — receiver was dropped");
-                }
-                // Keep the connection alive until the transport closes.
-                futures::future::pending::<Result<(), acp::Error>>().await
-            },
         )
 }
 
