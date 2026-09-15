@@ -58,6 +58,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
     },
+    thread::AccessError,
     time::Duration,
 };
 use uuid::Uuid;
@@ -354,17 +355,29 @@ fn draw_in_progress() -> bool {
 
 /// Allocates an element in the current arena. Uses the app-specific arena if one
 /// is active (during draw), otherwise falls back to the thread-local ELEMENT_ARENA.
+#[inline(always)]
 pub(crate) fn with_element_arena<R>(f: impl FnOnce(&mut Arena) -> R) -> R {
-    CURRENT_ELEMENT_ARENA.with(|current| {
-        if let Some(arena_ptr) = current.get() {
-            // SAFETY: The pointer is valid for the duration of the draw operation
-            // that set it, and we're being called during that same draw.
-            let arena_cell = unsafe { &*arena_ptr };
-            f(&mut arena_cell.borrow_mut())
-        } else {
-            ELEMENT_ARENA.with_borrow_mut(f)
-        }
-    })
+    let mut callback = Some(f);
+    let mut result = None;
+    let access = with_element_arena_erased(&mut |arena| {
+        result = Some(callback.take().expect("arena callback runs once")(arena));
+    });
+    drop(callback);
+    access.expect("cannot access a Thread Local Storage value during or after destruction");
+    result.expect("arena callback produces a result")
+}
+
+#[inline(never)]
+fn with_element_arena_erased(callback: &mut dyn FnMut(&mut Arena)) -> Result<(), AccessError> {
+    if let Some(arena_ptr) = CURRENT_ELEMENT_ARENA.try_with(Cell::get)? {
+        // SAFETY: The pointer is valid for the duration of the draw operation
+        // that set it, and we're being called during that same draw.
+        let arena_cell = unsafe { &*arena_ptr };
+        callback(&mut arena_cell.borrow_mut());
+        Ok(())
+    } else {
+        ELEMENT_ARENA.try_with(|arena| callback(&mut arena.borrow_mut()))
+    }
 }
 
 /// Scope guard that sets CURRENT_ELEMENT_ARENA for the duration of a draw
@@ -4042,10 +4055,7 @@ impl Window {
                     (state.clone(), state)
                 } else {
                     let new_state = cx.new(|cx| init(window, cx));
-                    cx.observe(&new_state, move |_, cx| {
-                        cx.notify(current_view);
-                    })
-                    .detach();
+                    Self::observe_keyed_state(&new_state, current_view, cx);
                     (new_state.clone(), new_state)
                 }
             })
@@ -4074,6 +4084,7 @@ impl Window {
     /// frames. If an element with this ID existed in the rendered frame, its state will be passed
     /// to the given closure. The state returned by the closure will be stored so it can be referenced
     /// when drawing the next frame. This method should only be called as part of element drawing.
+    #[inline(always)]
     pub fn with_element_state<S, R>(
         &mut self,
         global_id: &GlobalElementId,
@@ -4084,15 +4095,9 @@ impl Window {
     {
         self.invalidator.debug_assert_paint_or_prepaint();
 
-        let key = (global_id.clone(), TypeId::of::<S>());
-        self.next_frame.accessed_element_states.push(key.clone());
+        let (key, state) = self.take_element_state(global_id, TypeId::of::<S>());
 
-        if let Some(any) = self
-            .next_frame
-            .element_states
-            .remove(&key)
-            .or_else(|| self.rendered_frame.element_states.remove(&key))
-        {
+        if let Some(any) = state {
             let ElementStateBox {
                 inner,
                 #[cfg(debug_assertions)]
@@ -4126,7 +4131,7 @@ impl Window {
             );
             let (result, state) = f(Some(state), self);
             state_box.replace(state);
-            self.next_frame.element_states.insert(
+            self.insert_element_state(
                 key,
                 ElementStateBox {
                     inner: state_box,
@@ -4137,7 +4142,7 @@ impl Window {
             result
         } else {
             let (result, state) = f(None, self);
-            self.next_frame.element_states.insert(
+            self.insert_element_state(
                 key,
                 ElementStateBox {
                     inner: Box::new(Some(state)),
@@ -6968,6 +6973,39 @@ impl Window {
             pressed_button: None,
         });
         let _ = self.dispatch_event(event, cx);
+    }
+
+    #[inline(never)]
+    fn take_element_state(
+        &mut self,
+        global_id: &GlobalElementId,
+        state_type: TypeId,
+    ) -> ((GlobalElementId, TypeId), Option<ElementStateBox>) {
+        let key = (global_id.clone(), state_type);
+        self.next_frame.accessed_element_states.push(key.clone());
+        let state = self
+            .next_frame
+            .element_states
+            .remove(&key)
+            .or_else(|| self.rendered_frame.element_states.remove(&key));
+        (key, state)
+    }
+
+    #[inline(never)]
+    fn insert_element_state(
+        &mut self,
+        key: (GlobalElementId, TypeId),
+        state: ElementStateBox,
+    ) -> Option<ElementStateBox> {
+        self.next_frame.element_states.insert(key, state)
+    }
+
+    #[inline(never)]
+    fn observe_keyed_state<S: 'static>(state: &Entity<S>, current_view: EntityId, cx: &mut App) {
+        cx.observe(state, move |_, cx| {
+            cx.notify(current_view);
+        })
+        .detach();
     }
 }
 
